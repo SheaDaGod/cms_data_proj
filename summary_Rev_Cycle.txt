@@ -1,0 +1,176 @@
+# Revenue Cycle Adaptation Memo (Prototype → Cooper Use Case)
+
+## Purpose
+This project is a **public-data prototype** that demonstrates an end-to-end analytics workflow relevant to Revenue Cycle operations: ingest large healthcare payment/utilization data, apply cleaning + guardrails, derive decision metrics, generate outlier-oriented visuals, and output **review worklists**.  
+It is **not** a denial/underpayment system yet because the CMS file lacks payer contract detail, claim IDs, denial codes, and remittance adjustment data.
+
+## What the prototype does today
+Using the CMS “Medicare Physician & Other Practitioners — by Provider and Service (2023)” dataset (single-year), the script:
+- streams and cleans the dataset from a ZIP
+- computes derived metrics:
+  - **Impact proxy:** `Allowed_$ ≈ Avg_Mdcr_Alowd_Amt * Tot_Srvcs`
+  - **Intensity:** `Tot_Srvcs / Tot_Benes`
+  - **Charge compression:** `Avg_Sbmtd_Chrg / Avg_Mdcr_Alowd_Amt`
+- produces outlier-oriented visuals:
+  - distribution view (heavy tails)
+  - concentration by specialty (where dollars sit)
+  - charge-compression dispersion by specialty
+  - intensity vs compression “triage map”
+  - RUCA × specialty heatmap (rural/urban segmentation)
+- writes local CSV worklists to support targeted review.
+
+## What this proves (transferable Revenue Cycle skills)
+- **Data ingestion at scale:** chunked reads, type coercion, category normalization
+- **Data quality & guardrails:** denominator thresholds and ratio handling to reduce false positives
+- **Metric engineering:** turning averages + counts into impact proxies and operational ratios
+- **Prioritization:** generating ranked “review candidate” lists (worklists)
+- **Communication:** visuals designed for triage, not for academic novelty
+
+## Key limitations (why conclusions must be framed as hypotheses)
+This CMS file is aggregated at **NPI × HCPCS × Place of Service** and lacks:
+- claim IDs / account IDs
+- payer plan and contract terms
+- denial/reject/remark codes (CARC/RARC)
+- adjustment amounts and reasons from remits (835)
+- submission/resolution timestamps (timely filing, appeals aging)
+- patient responsibility and secondary payer context
+
+Therefore:
+- scatter plots that use sampling are for **shape recognition and triage design**, not definitive claims.
+- “outliers” are **candidates for review**, not proof of error or wrongdoing.
+
+## How to adapt this into a real Revenue Cycle analytics workflow at Cooper
+### Step 1 — Replace/augment the dataset with internal extracts
+To make this operational, request extracts that add claim-line detail and denial/remit context.
+
+**Minimum viable internal fields (claim-line level):**
+- Claim identifiers: `claim_id`, `account_id`, `line_id`
+- Dates: `date_of_service`, `date_billed`, `date_submitted`, `date_paid`, `denial_date`, `appeal_date`, `resolution_date`
+- Parties: `rendering_provider`, `billing_provider`, `facility`, `department`
+- Payer: `payer`, `plan`, `product`, `network`
+- Coding: `HCPCS/CPT`, `modifiers`, `ICD-10`, `units`
+- Financials: `billed`, `allowed`, `paid`, `contract_expected` (if available), `patient_resp`, `adjustments_total`
+- Denial data: denial category, denial status, denial reason mapping
+- Remittance (835): CARC/RARC, adjustment group codes, remark text (where permitted)
+
+### Step 2 — Add a simple data model (so reporting stays stable)
+Treat the CMS prototype as a “fact table” practice run, then adopt a clean internal model:
+
+- `fact_claim_line` (one row per claim line)
+- `dim_provider`, `dim_department`, `dim_payer`, `dim_service_code`, `dim_time`
+- `fact_remit_adjustment` (CARC/RARC adjustments linked to claim lines)
+
+This makes it easy to keep KPI reporting stable even when upstream systems change.
+
+### Step 3 — Convert prototype metrics into Revenue Cycle metrics
+The prototype uses proxies; inside Cooper, you upgrade them:
+
+**From** `Allowed_$ ≈ Avg_Allowed * Tot_Srvcs`  
+**To** `Allowed_$ = SUM(allowed_amount)` at claim-line level
+
+**From** intensity `Tot_Srvcs / Tot_Benes`  
+**To** utilization/throughput measures that matter to Rev Cycle:
+- first-pass yield
+- denial rate (count + $)
+- overturn rate
+- underpayment rate
+- days to resolution
+- timely filing risk queue
+
+### Step 4 — Build the worklists that a Denials/RC analyst actually runs
+The prototype’s outlier CSVs become scaffolding for three production worklists.
+
+#### A) Denial Worklist (preventable + high impact)
+**Goal:** prioritize denials that are both expensive and fixable.
+
+Core fields:
+- denial category (eligibility/auth/medical necessity/coding/COB/timely filing/etc.)
+- denial amount (allowed or expected recoverable)
+- payer/plan + dept + provider
+- days since denial and filing deadlines
+- recurrence frequency
+
+Simple scoring (start):
+- `Priority = Denied_$ * RecurrenceScore * UrgencyScore`
+
+Better scoring (later):
+- `Priority = ExpectedRecoverable_$ * WinProbability * UrgencyFactor`
+
+#### B) Underpayment Worklist (contract variance)
+**Goal:** detect “paid < expected” cases and prioritize by dollars and confidence.
+
+Requires:
+- contract expected allowed amount (or modeled expected)
+- paid amount
+- variance = expected - paid
+
+Scoring:
+- `Priority = Variance_$ * ConfidenceScore`
+
+#### C) Process Defect Worklist (root cause elimination)
+**Goal:** identify where the organization is bleeding repeatedly due to workflow errors.
+
+Examples:
+- repeated auth denials in specific departments
+- repeated coding denials for specific services/providers
+- payer-specific rejections caused by registration errors
+
+Outputs:
+- a top-10 list of recurring defect patterns
+- recommended owner (registration, coding, clinical dept, contracting)
+- before/after KPI tracking
+
+### Step 5 — Use the same guardrails you built in the prototype
+The funnel logic in the prototype is not a “nice chart”—it becomes policy:
+- don’t flag low-volume noise as operational problems
+- tier review thresholds by volume bands
+- always show the denominator next to a ratio metric
+
+Practical rules:
+- minimum claim-line counts before labeling a provider/service as an outlier
+- percentile-based thresholds within peer groups (specialty × department × setting)
+
+### Step 6 — Operationalize: refresh, QA, and feedback loops
+To make analytics actionable, add:
+- refresh cadence (daily or weekly depending on volume)
+- QA checks (missingness spikes, sudden KPI jumps, schema drift)
+- an intervention log (what change was made, when, owner)
+- tracking: denial rate / cash acceleration / resolution time before vs after
+
+This is the difference between “reporting” and “improving cash flow.”
+
+## How to interpret the current prototype charts (without overclaiming)
+### Concentration by specialty
+Use it to justify focus:
+- where allowed dollars and service volume concentrate, prioritize review effort.
+
+### Charge-to-allowed dispersion by specialty
+Use it to identify specialties with:
+- unusually high typical compression (median)
+- unusually wide spread (dispersion)
+These are **candidates** for deeper internal analysis, not conclusions.
+
+### Intensity vs compression “triage map”
+Use it to generate candidate review zones:
+- high intensity = high operational exposure
+- high compression = pricing/charge behavior extremes
+Most useful when combined with impact proxy (`Allowed_$`) and denominator filters.
+
+### RUCA × Specialty heatmap
+Use it for segmentation:
+- rural/urban differences in service intensity by specialty can indicate access and practice-pattern differences.
+Inside a hospital system, a similar heatmap by **facility/department** is often even more actionable.
+
+## How to tune the prototype for better “review lists”
+The script has levers at the top:
+- `MIN_BENES_FOR_OUTLIERS`, `MIN_SERVCS_FOR_OUTLIERS` (noise reduction)
+- `TOPK_KEEP` (how many review candidates to export)
+- `SAMPLE_FRAC` (visual density; does not change full aggregations)
+- Add peer-normalization (recommended next step):
+  - compute percentiles or robust z-scores within specialty × place-of-service
+  - rank by “unusual relative to peers,” not absolute ratios
+
+## Interview positioning (how to present this without BS)
+- “This project is public-data scaffolding; it demonstrates the workflow and outputs (worklists + visuals).”
+- “Inside Cooper, the same pipeline plugs into Epic reporting + remittance/denial data to produce denial and underpayment worklists.”
+- “My first-week value is standing up repeatable reporting and a prioritized review queue, then working with stakeholders to validate root causes and measure improvement.”
